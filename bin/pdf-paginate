@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""pdf-paginate — stamp a running footer on every page of a PDF, in place.
+
+    pdf-paginate <file.pdf> "<label>"
+    e.g.  pdf-paginate report.pdf "Acme Ltd · Q3 Review"
+
+Footer: "<label> · Page N of T", centred, 8.5pt grey, inside the bottom margin
+(render-doc's margins leave it clear of the text block).
+
+WHY: render-doc produces no page numbers, and a multi-page document without them
+is unnavigable — someone says "page 23" and nobody can find it. Some documents
+are also formally REQUIRED to carry them (in England and Wales, CPR Practice
+Direction 5A para 2.2 for court documents, and PD 32 para 19.1 for witness
+statements, which also want the case number on each page — the label carries it).
+
+⚠ Run this LAST. render-doc rewrites the PDF on every render, so the stamp is
+lost until re-applied. Paginate, then verify, then send.
+
+The page numbers are COMPUTED from the PDF, never hand-kept. Doctrine rule 11.
+
+Part of claude-typeset. MIT.
+"""
+import os, sys
+
+
+def _preview_sync(path, reopen=False):
+    """Close any Preview window already showing `path`; optionally reopen it.
+
+    Preview does not reload a PDF that has been replaced on disk, so without
+    this a re-render leaves a window still rendering the superseded version —
+    two windows for one file, one of them silently stale. Returns True if
+    Preview had the file open. Never launches Preview.
+    """
+    import os as _os, subprocess as _sp, sys as _sys
+    if _sys.platform != 'darwin':
+        return False
+    p = _os.path.abspath(_os.path.expanduser(path))
+    if _sp.run(['pgrep', '-x', 'Preview'], stdout=_sp.DEVNULL).returncode != 0:
+        return False
+    scpt = (
+        'on run argv\n'
+        '  set t to item 1 of argv\n'
+        '  set found to false\n'
+        '  tell application "Preview"\n'
+        '    repeat with i from (count documents) to 1 by -1\n'
+        '      try\n'
+        '        if (path of document i) is t then\n'
+        '          set found to true\n'
+        '          close document i saving no\n'
+        '        end if\n'
+        '      end try\n'
+        '    end repeat\n'
+        '  end tell\n'
+        '  return found as string\n'
+        'end run\n')
+    try:
+        r = _sp.run(['osascript', '-e', scpt, p],
+                    capture_output=True, text=True, timeout=20)
+        was_open = r.stdout.strip() == 'true'
+    except Exception:
+        return False
+    if was_open and reopen:
+        _sp.run(['open', p])
+    return was_open
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit(__doc__)
+    path, label = sys.argv[1], sys.argv[2]
+    try:
+        import fitz
+    except ImportError:
+        sys.exit("pdf-paginate needs PyMuPDF:  pip install pymupdf")
+    d = fitz.open(path)
+    n = d.page_count
+    for i, p in enumerate(d):
+        txt = f"{label} · Page {i + 1} of {n}"
+        w = fitz.get_text_length(txt, fontname="helv", fontsize=8.5)
+        x = (p.rect.width - w) / 2
+        y = p.rect.height - 34          # ~1.2 cm up: inside the margin, below the text block
+        p.insert_text((x, y), txt, fontname="helv", fontsize=8.5, color=(0.35, 0.35, 0.35))
+    tmp = path + ".paginating.pdf"
+    d.save(tmp)
+    d.close()
+    os.replace(tmp, path)
+    _preview_sync(path, reopen=True)   # refresh an already-open window; never opens one
+    print(f"paginated {n} pages → {path}")
+
+if __name__ == "__main__":
+    main()

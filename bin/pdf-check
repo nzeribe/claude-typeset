@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""pdf-check — read a finished PDF and ask it the questions that catch real defects.
+
+    pdf-check <file.pdf> [--expect "phrase"] [--markers "TODO,FIXME"] [--quiet]
+
+Exit code 0 if everything passes, 1 if anything fails. Safe in a build script.
+
+WHY: `strings file.pdf | grep TODO` LIES. It returns clean on documents that
+are visibly contaminated, because a PDF's text lives in compressed streams that
+`strings` cannot read. Three documents once passed that check with a count of 0
+while being full of unresolved ⟦MARKERS⟧ and internal drafting commentary; a
+proper text extraction found the leaks immediately. Verify the ARTEFACT with a
+library that can actually read it.
+
+The second lesson is bigger than the first: a check only finds what it is told
+to look for. When a defect gets through, WIDEN THE CHECK — don't just fix the
+instance. Every question below was added the day something got past the ones
+above it.
+
+THE QUESTIONS
+  1. Drafter's notes    — unresolved markers, internal commentary, TODOs
+  2. HTML entities      — `&nbsp;` and friends rendered LITERALLY, as characters
+  3. Numbering          — ordered lists silently restarting at 1
+  4. Pagination         — does a multi-page document carry page numbers
+  5. Freshness          — is the newest change actually in this build
+
+(4) and (5) exist because a build folder fills with near-identical PDFs and
+nothing in a filename says "superseded". A stale build is identified by what it
+is MISSING: pick a phrase only the current version has and pass it to --expect.
+
+Part of claude-typeset. MIT.
+"""
+import sys, re, argparse
+
+DEFAULT_MARKERS = ['⟦', '⟧', '<!--', 'TODO', 'FIXME', 'XXX', 'CONFIRM',
+                   'DRAFT', 'TK', '[[', 'Lorem ipsum']
+ENTITIES = ['&nbsp;', '&amp;', '&lt;', '&gt;', '&quot;', '&#']
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Verify a rendered PDF before it leaves the house.")
+    ap.add_argument('pdf')
+    ap.add_argument('--expect', action='append', default=[],
+                    help='a phrase that MUST be present (repeatable) — proves this '
+                         'is the current build, not a stale sibling')
+    ap.add_argument('--markers', help='comma-separated extra leak markers')
+    ap.add_argument('--no-numbering', action='store_true', help='skip the numbering check')
+    ap.add_argument('--quiet', action='store_true', help='only report failures')
+    a = ap.parse_args()
+
+    try:
+        import fitz
+    except ImportError:
+        sys.exit("pdf-check needs PyMuPDF:  pip install pymupdf")
+
+    doc = fitz.open(a.pdf)
+    pages = [p.get_text() for p in doc]
+    n = doc.page_count
+    doc.close()
+    raw = "".join(pages)
+
+    fails = []
+    notes = []
+
+    def ok(label, detail=''):
+        if not a.quiet:
+            print(f"  ✓ {label}" + (f"  — {detail}" if detail else ''))
+
+    def bad(label, detail):
+        fails.append(label)
+        print(f"  ✗ {label}  — {detail}")
+
+    print(f"\n  {a.pdf}   ({n} page{'s' if n != 1 else ''})")
+    print(f"  {'─' * 58}")
+
+    # 1. drafter's notes ------------------------------------------------------
+    markers = list(DEFAULT_MARKERS)
+    if a.markers:
+        markers += [m.strip() for m in a.markers.split(',') if m.strip()]
+    hits = sorted({m for m in markers if m in raw})
+    if hits:
+        bad("drafter's notes", f"found {', '.join(repr(h) for h in hits)} — DO NOT SEND")
+    else:
+        ok("no drafter's notes", f"{len(markers)} markers checked")
+
+    # 2. HTML entities rendered literally -------------------------------------
+    ehits = sorted({e for e in ENTITIES if e in raw})
+    if ehits:
+        bad("HTML entities printed literally",
+            f"{', '.join(ehits)} — never use &nbsp; for indentation; "
+            "use two real leading spaces")
+    else:
+        ok("no literal HTML entities")
+
+    # 3. ordered-list numbering ------------------------------------------------
+    if not a.no_numbering:
+        seq = [int(m) for m in re.findall(r'(?m)^\s*(\d{1,3})[.)]\s', raw)]
+        restarts = [i for i in range(1, len(seq)) if seq[i] == 1 and seq[i - 1] > 1]
+        if len(seq) < 3:
+            ok("numbering", "no numbered paragraphs to check")
+        elif restarts:
+            bad("numbering restarts",
+                f"{len(restarts)} restart(s) at 1 — a renderer renumbers every "
+                f"ordered list from 1. Hard-number anything that will be CITED "
+                f"(write `**6.** text` as its own paragraph, not `6. text`). "
+                f"Sequence: {seq[:24]}{'…' if len(seq) > 24 else ''}")
+        else:
+            ok("numbering runs clean", f"{len(seq)} numbered items, no restarts")
+
+    # 4. pagination ------------------------------------------------------------
+    if n > 1:
+        paged = bool(re.search(r'Page\s+\d+\s+of\s+\d+', raw)) or \
+            sum(bool(re.search(r'(?m)^\s*\d{1,3}\s*$', p)) for p in pages) >= n - 1
+        if paged:
+            ok("pages are numbered")
+        else:
+            notes.append("pagination")
+            print("  ! no page numbers found  — a multi-page document should carry "
+                  "them:\n      pdf-paginate \"" + a.pdf + "\" \"<label>\"  (run it LAST)")
+    else:
+        ok("single page", "pagination not needed")
+
+    # 5. freshness -------------------------------------------------------------
+    # Whitespace is normalised on both sides: a phrase that WRAPS across a line
+    # arrives from the extractor with a newline inside it, and a check that
+    # cries wolf on a good build is a check that gets switched off.
+    flat = re.sub(r'\s+', ' ', raw)
+    for phrase in a.expect:
+        if re.sub(r'\s+', ' ', phrase).strip() in flat:
+            ok("expected phrase present", repr(phrase[:48]))
+        else:
+            bad("expected phrase MISSING", f"{phrase[:48]!r} — this looks like a "
+                                           "STALE build. Check the folder for siblings.")
+
+    print(f"  {'─' * 58}")
+    if fails:
+        print(f"  ✗ {len(fails)} FAILED: {', '.join(fails)}. Do not send.\n")
+        sys.exit(1)
+    if notes:
+        print("  ✓ passed, with a note above.\n")
+    else:
+        print("  ✓ all checks passed.\n")
+
+
+if __name__ == '__main__':
+    main()

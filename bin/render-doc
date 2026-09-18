@@ -1,0 +1,580 @@
+#!/usr/bin/env python3
+"""render-doc — set a Markdown file as a PAGE: themed offline HTML, and PDF.
+
+    render-doc <file.md>              # open the page in your browser
+    render-doc <file.md> --pdf        # THE OUTBOUND ROUTE: straight to PDF
+
+One command, one design, no settings to get wrong. Never a browser print
+dialog, never an app's "export to PDF" — those carry their own margins and
+throw away the measure, which is the whole game. See DOCTRINE.md.
+
+Usage:
+  render-doc <file.md> [--save] [--out PATH] [--pdf [PATH]] [--no-open]
+                       [--title T] [--measure 118mm] [--body-font "..."]
+
+  --save          write <file>.html beside the source (default: a cache file)
+  --out PATH      write the HTML to PATH
+  --pdf [PATH]    render straight to PDF (default: alongside the source)
+  --no-open       just write the file; don't open it
+  --title T       override the page <title>
+  --measure M     the text column, e.g. 128mm (env: TYPESET_MEASURE)
+  --body-font F   body font stack     (env: TYPESET_BODY_FONT)
+
+  ⚠ --measure and --body-font move together. The point size does NOT carry
+    the measure across a font change; re-measure the PDF with `pdf-measure`
+    and adjust until you are inside 45-75 characters. Doctrine rule 2.
+
+Images: ![alt](path) — EMBEDDED as a data: URI, never linked, so the page
+stays self-contained. A missing image is a HARD FAILURE, not a silent
+omission. Alt text "signature" renders an ink signature at letter scale;
+any other alt renders a centred figure.
+
+Hard line breaks: end a line with a BACKSLASH to break it without starting a
+new paragraph — for letterheads, recipient blocks and signature blocks.
+Markdown's two trailing spaces are deliberately NOT honoured; see render_body.
+
+Tables are REAL ruled tables, because a browser has a real CSS engine.
+
+Part of claude-typeset. MIT.
+"""
+import sys, os, re, html, argparse, subprocess, hashlib, time
+
+CSS = r"""
+/* ---------------------------------------------------------------------------
+   PAGE VIEW. Rebuilt 2026-08-10 on the operator's objection: "DTP was
+   predicated on what-you-see-is-what-you-get." Before this the screen was a
+   940px web page in the system sans and the printer produced a 118mm column in
+   Gill Sans -- two different documents from one file, which is the exact fault
+   we spent the evening removing from Marked and md2pdf.
+
+   So the screen now shows THE PAGE: a white sheet on a grey desk, at the real
+   measure, in the real typeface, at the real size (118mm / 11.5pt Gill Sans,
+   measured to ~67 characters). The @media print block below removes the desk
+   and the shadow and changes nothing else. One design, two outputs.
+
+   The cost, accepted deliberately: the wide comfortable reading column is gone.
+   Screen reading is tighter in exchange for the printed page being knowable.
+   --------------------------------------------------------------------------- */
+:root {
+  color-scheme: light dark;
+  --measure: @@MEASURE@@;      /* the text column -- see the print block for why */
+  --sheet-pad: 20mm 26mm;
+  --ink: #1b1b1a;
+  --sheet: #ffffff;
+  --desk: #d9d8d3;
+}
+html { background: var(--desk); }
+body { font-family: @@BODYFONT@@;
+  font-size: 11.5pt; line-height: 1.55;
+  width: var(--measure); max-width: 100%;
+  margin: 2.5rem auto; padding: var(--sheet-pad);
+  box-sizing: content-box;
+  color: var(--ink); background: var(--sheet);
+  box-shadow: 0 2px 16px rgba(0,0,0,.22); border-radius: 2px; }
+h1, h2, h3, h4 { font-family: Georgia, "Times New Roman", serif; color: #000; }
+h1 { font-size: 16pt; margin-bottom: .15rem; letter-spacing: 0; line-height: 1.25; }
+h2 { font-size: 12.5pt; margin-top: 2.1rem; border-bottom: 1px solid #d8d6cf; padding-bottom: .3rem; }
+h3 { font-size: 11pt; margin-top: 1.7rem; }
+h4 { font-size: 10.5pt; margin-top: 1.3rem; color: #444; }
+p.sub { color: #5a5a54; font-size: 10pt; margin-top: .15rem; }
+pre.diagram { background: #1b1d22; color: #e9e9e3; border-radius: 11px; padding: 1.5rem 1.3rem;
+  overflow-x: auto; margin: 1.6rem 0; font-family: "SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  font-size: 12.5px; line-height: 1.34; box-shadow: 0 3px 18px rgba(0,0,0,.13); }
+code { background: #ece7dd; padding: .08em .3em; border-radius: 3px;
+  font-family: "SF Mono",Menlo,monospace; font-size: 9pt; }
+.wl { color: #9a6b00; font-weight: 500; }
+a { color: #1f8a52; text-decoration: none; } a:hover { text-decoration: underline; }
+strong { color: #000; } em { color: #333; }
+ul, ol { padding-left: 1.25rem; } li { margin: .35rem 0; }
+blockquote { border-left: 2pt solid #b9b4a6; margin: 1.1rem 0; padding: .2rem .9rem;
+  color: #444; background: #f7f5ef; border-radius: 0; }
+/* Table sizing matches the print block, so a grid that fits the sheet on screen
+   fits the sheet on paper. */
+table { border-collapse: collapse; margin: 1.2rem 0; width: 100%; font-size: 9.5pt; }
+th, td { border: 0.5pt solid #666; padding: 4pt 6pt; text-align: left; vertical-align: top;
+  line-height: 1.4; }
+th { background: #ececec; font-weight: bold; }
+hr { border: none; border-top: 1px solid #cfcdc6; margin: 1.8rem 0; }
+
+/* Images are embedded as data: URIs (see embed_image) so the sheet stays self-contained.
+   .sig is the ink signature that sits between "Yours faithfully," and the typed name:
+   46mm on a 118mm measure -- about a third of the line, which is what a signed letter
+   looks like. Wider reads as a flourish; narrower reads as apologetic. The tight
+   negative margin below closes the gap to the name block so the two read as one unit. */
+img.sig { display: block; width: 46mm; height: auto;
+          margin: 1mm 0 -1mm; }
+img.fig { display: block; max-width: 100%; height: auto; margin: 1.2rem auto; }
+@media (prefers-color-scheme: dark) {
+  /* Dark mode dims the DESK, not the sheet -- a page is a page. The paper is
+     knocked back off pure white so it isn't a torch in a dark room, but it stays
+     light, and the ink stays dark, so what is on screen is still what prints. */
+  :root { --desk: #121316; --sheet: #f4f2ec; --ink: #1b1b1a; }
+  html { background: var(--desk); }
+  body { color: var(--ink); background: var(--sheet);
+         box-shadow: 0 2px 22px rgba(0,0,0,.55); }
+  h1, h2, h3, h4 { color: #000; }
+  h2 { border-color: #d8d6cf; } h3 { color: #222; } h4 { color: #444; }
+  code { background: #e4dfd4; color: #1b1b1a; }
+  strong { color: #000; } em { color: #333; }
+  p.sub { color: #5a5a54; }
+  blockquote { background: #ece9e0; border-color: #b9b4a6; color: #444; }
+  th { background: #ececec; } th, td { border-color: #666; }
+  hr { border-color: #cfcdc6; }
+  a { color: #1f8a52; }
+}
+
+/* ---------------------------------------------------------------------------
+   PRINT. Added 2026-08-10. Until then this file had no print rules at all: a
+   940px column printed at roughly 117 characters per line -- the same "blob"
+   that made every printed document unreadable, just in a different app.
+
+   The point of this block is that a BROWSER has a real CSS engine, so it will
+   draw a genuine ruled table -- which the AppKit path behind ~/bin/md2pdf
+   cannot do at any price (tested: it flattens every cell onto its own line).
+   So: md2pdf for prose documents, this for anything TABULAR -- a schedule of
+   loss, a costs schedule -- printed to PDF from the browser.
+
+   Measure is the whole game (Bringhurst: 45-75 characters, 66 ideal). A4 is
+   210mm; 35mm side margins leave a 140mm column, which at 10.5pt lands around
+   66-70 characters. 35mm also satisfies PD 5A para 2.2(1) -- margins "not less
+   than 3.5 centimetres" -- so a page printed this way is court-compliant.
+   --------------------------------------------------------------------------- */
+@page { size: A4; margin: 20mm 35mm; }
+
+@media print {
+  /* Force the light palette: dark-mode screens must not print as ink slabs. */
+  /* The screen ALREADY shows the page -- same 118mm measure, same Gill Sans at
+     11.5pt, same Georgia headings. So this block does not restyle the document;
+     it takes away the desk and the shadow and lets the sheet become the sheet.
+     Everything that governs how the text sets is defined once, above.
+
+     Two things must still be forced here. The paper is white on paper (dark mode
+     knocks it back on screen), and the ink is black. And the measure is pinned on
+     the BODY in mm rather than left to @page, because browsers disagree about
+     @page margins -- headless Chrome ignored the 35mm sides when tested.
+
+     On the 118mm/11.5pt pair: arrived at by MEASURING the printed PDF, not by
+     arithmetic. Browsers set Gill Sans far narrower than AppKit does (Chrome
+     embeds it as a Type 3 face), so the nominal size that gives ~68 characters
+     through ~/bin/md2pdf gave 89 here. Bringhurst's band is 45-75, 66 ideal;
+     these land at 67. Change the body font and RE-MEASURE -- the point size does
+     not carry the measure across. */
+  html { background: #fff; }
+  body { color: #1b1b1a; background: #fff;
+         width: @@MEASURE@@; max-width: @@MEASURE@@; margin: 0 auto; padding: 0;
+         box-shadow: none; border-radius: 0; }
+  h1, h2, h3, h4 { page-break-after: avoid; break-after: avoid; }
+  p, li { orphans: 3; widows: 3; }
+
+  /* Repeat the header row on every page, and never split a row across pages. */
+  thead { display: table-header-group; }
+  tr { page-break-inside: avoid; break-inside: avoid; }
+  th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  /* ASCII diagrams: the dark panel is a screen affordance; on paper it must be
+     ink-cheap and legible, and it must never be split across a page break. */
+  pre.diagram { background: #fff !important; color: #000 !important;
+                border: 0.5pt solid #999; box-shadow: none; border-radius: 0;
+                font-size: 8.5pt; line-height: 1.3; padding: 8pt;
+                page-break-inside: avoid; break-inside: avoid;
+                -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  code { background: transparent; color: #000; font-size: 9pt; }
+  blockquote { background: transparent; border-left: 2pt solid #999;
+               color: #222; border-radius: 0; page-break-inside: avoid; }
+
+  /* Links print black; the URL is spelled out so a paper copy stays traceable.
+     Internal and anchor links are left bare -- only external ones earn a tail. */
+  a { color: #000; text-decoration: none; }
+  a[href^="http"]::after { content: " <" attr(href) ">";
+                           font-size: 8pt; color: #555; word-break: break-all; }
+  hr { border-color: #999; }
+}
+"""
+
+TEMPLATE = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>{css}</style></head>
+<body>
+{body}
+</body></html>"""
+
+SO, SC = '', ''  # code-span sentinels
+BR = '\ue002'  # hard-line-break sentinel (trailing backslash); see render_body
+
+
+def strip_frontmatter(text):
+    meta = {}
+    if text.startswith('---\n'):
+        end = text.find('\n---', 4)
+        if end != -1:
+            for line in text[4:end].splitlines():
+                m = re.match(r'^([A-Za-z0-9_-]+):\s*(.*)$', line)
+                if m:
+                    meta[m.group(1).strip()] = m.group(2).strip().strip('"').strip("'")
+            return meta, text[end + 4:].lstrip('\n')
+    return meta, text
+
+
+DOC_DIR = ''  # directory of the source .md; relative image paths resolve against it
+
+IMG_MIME = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif', '.svg': 'image/svg+xml', '.webp': 'image/webp'}
+
+
+def embed_image(src):
+    """Return a base64 data: URI for src, so the page stays SELF-CONTAINED.
+
+    The whole point of this tool is a file:// page with no network and no external
+    assets, and a headless-Chrome print that carries everything with it. A linked
+    image would break that the moment the HTML is moved or emailed.
+
+    Missing images are a HARD FAILURE, not a silent omission. A letter that renders
+    without its signature looks finished and is not -- the same class of fault as the
+    collapsed signature block of 2026-09-17, which passed a text-layer check because
+    the words were all present. Fail loudly at render time instead.
+    """
+    import base64
+    path = os.path.expanduser(src)
+    if not os.path.isabs(path):
+        path = os.path.join(DOC_DIR, path)
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        sys.exit(f'render-doc: image not found: {src}\n'
+                 f'  looked in: {path}\n'
+                 f'  (images are embedded, not linked -- a missing one is a failed render)')
+    ext = os.path.splitext(path)[1].lower()
+    mime = IMG_MIME.get(ext)
+    if not mime:
+        sys.exit(f'render-doc: unsupported image type {ext!r}: {src}')
+    with open(path, 'rb') as fh:
+        return f'data:{mime};base64,' + base64.b64encode(fh.read()).decode('ascii')
+
+
+def inline(text):
+    codes = []
+
+    def stash(m):
+        codes.append(html.escape(m.group(1)))
+        return f'{SO}{len(codes)-1}{SC}'
+
+    text = re.sub(r'`([^`]+)`', stash, text)
+    text = html.escape(text)
+    # wiki-links [[a]] / [[a|b]]  -> styled span showing the alias/name
+    text = re.sub(r'\[\[([^\]]+)\]\]',
+                  lambda m: f'<span class="wl">{m.group(1).split("|")[-1].strip()}</span>', text)
+    # images ![alt](src) -- MUST precede the link rule, which would otherwise eat them.
+    # alt text "signature" gets the signature sizing; anything else is a plain figure.
+    def _img(m):
+        alt, src = m.group(1), m.group(2).strip()
+        cls = 'sig' if alt.strip().lower() == 'signature' else 'fig'
+        return f'<img class="{cls}" src="{embed_image(src)}" alt="{alt}">'
+    text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', _img, text)
+    # markdown links [text](url)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
+    text = re.sub(SO + r'(\d+)' + SC, lambda m: f'<code>{codes[int(m.group(1))]}</code>', text)
+    return text
+
+
+def render_body(body):
+    lines, out, i, n = body.split('\n'), [], 0, len(body.split('\n'))
+    while i < n:
+        line = lines[i]
+        if line.lstrip().startswith('```'):
+            i += 1
+            buf = []
+            while i < n and not lines[i].lstrip().startswith('```'):
+                buf.append(lines[i]); i += 1
+            i += 1
+            out.append(f'<pre class="diagram">{html.escape(chr(10).join(buf))}</pre>')
+            continue
+        if line.strip() == '':
+            i += 1; continue
+        m = re.match(r'^(#{1,4})\s+(.*)$', line)
+        if m:
+            lvl = len(m.group(1))
+            out.append(f'<h{lvl}>{inline(m.group(2))}</h{lvl}>'); i += 1; continue
+        if re.match(r'^(---|\*\*\*|___)\s*$', line):
+            out.append('<hr>'); i += 1; continue
+        if line.lstrip().startswith('>'):
+            buf = []
+            while i < n and lines[i].lstrip().startswith('>'):
+                buf.append(re.sub(r'^\s*>\s?', '', lines[i])); i += 1
+            out.append(f'<blockquote>{inline(" ".join(buf))}</blockquote>'); continue
+        if '|' in line and i + 1 < n and re.match(r'^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$', lines[i + 1]):
+            header = [c.strip() for c in line.strip().strip('|').split('|')]
+            i += 2
+            rows = []
+            while i < n and '|' in lines[i] and lines[i].strip():
+                rows.append([c.strip() for c in lines[i].strip().strip('|').split('|')]); i += 1
+            th = ''.join(f'<th>{inline(c)}</th>' for c in header)
+            trs = ''.join('<tr>' + ''.join(f'<td>{inline(c)}</td>' for c in r) + '</tr>' for r in rows)
+            out.append(f'<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>'); continue
+        if re.match(r'^\s*[-*]\s+', line):
+            items = []
+            while i < n and re.match(r'^\s*[-*]\s+', lines[i]):
+                items.append(re.sub(r'^\s*[-*]\s+', '', lines[i])); i += 1
+            out.append('<ul>' + ''.join(f'<li>{inline(it)}</li>' for it in items) + '</ul>'); continue
+        if re.match(r'^\s*\d+\.\s+', line):
+            items = []
+            while i < n and re.match(r'^\s*\d+\.\s+', lines[i]):
+                items.append(re.sub(r'^\s*\d+\.\s+', '', lines[i])); i += 1
+            out.append('<ol>' + ''.join(f'<li>{inline(it)}</li>' for it in items) + '</ol>'); continue
+        buf = []
+        while i < n and lines[i].strip() != '' and not lines[i].lstrip().startswith('```') \
+                and not re.match(r'^#{1,4}\s', lines[i]) and not re.match(r'^\s*[-*]\s+', lines[i]) \
+                and not lines[i].lstrip().startswith('>') and not re.match(r'^\s*\d+\.\s+', lines[i]) \
+                and not re.match(r'^(---|\*\*\*|___)\s*$', lines[i]):
+            buf.append(lines[i]); i += 1
+        # Hard line break: a line ending in a backslash breaks the line WITHOUT starting
+        # a new paragraph -- for letterheads, recipient blocks and signature blocks,
+        # which are several lines of ONE block and must not carry inter-paragraph space.
+        #
+        # Backslash, not Markdown's two trailing spaces, is deliberate. Trailing
+        # whitespace is invisible and, in the corpus this was built against, already
+        # sat mid-paragraph in 72 lines -- so honouring it would have silently re-broken
+        # documents that rendered correctly. A trailing backslash appears nowhere in
+        # ordinary prose and cannot be typed by accident.
+        #
+        # Born from a real failure: a three-line signature block rendered as one long
+        # line -- "Name / Title / Role" run together -- and the letterhead and recipient
+        # address had been collapsing the same way, unnoticed, on every letter the tool
+        # had ever produced. An invisible notation is not a notation.
+        segs = []
+        for ln in buf:
+            s_ = ln.rstrip()
+            hard = s_.endswith('\\')
+            if hard:
+                s_ = s_[:-1].rstrip()
+            segs.append((s_, hard))
+        text = ''
+        for k, (s_, hard) in enumerate(segs):
+            if text and not text.endswith(BR):
+                text += ' '
+            text += s_
+            if hard and k < len(segs) - 1:
+                text += BR
+        out.append(f'<p>{inline(text).replace(BR, "<br>")}</p>')
+    return '\n'.join(out)
+
+
+# A Chromium-family browser is the typesetter: it is the only engine on a normal
+# machine that draws a real ruled table, honours page-break control and repeats a
+# header row. macOS first, then Linux, then Windows, then anything on $PATH.
+CHROME_PATHS = [
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/brave-browser',
+    '/usr/bin/microsoft-edge', '/snap/bin/chromium',
+    r'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    r'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+]
+
+
+def find_browser():
+    """First Chromium-family browser on this machine, or None."""
+    import shutil
+    for p in CHROME_PATHS:
+        if os.path.exists(p):
+            return p
+    for n in ('google-chrome', 'google-chrome-stable', 'chromium',
+              'chromium-browser', 'brave-browser', 'microsoft-edge', 'chrome'):
+        found = shutil.which(n)
+        if found:
+            return found
+    return None
+
+
+def open_file(path):
+    """Hand a finished file to the desktop, on whatever desktop this is."""
+    try:
+        if sys.platform == 'darwin':
+            subprocess.run(['open', path])
+        elif sys.platform.startswith('win'):
+            os.startfile(path)  # noqa: S606 - platform API
+        else:
+            subprocess.run(['xdg-open', path])
+    except Exception as e:
+        print(f'render-doc: wrote {path} (could not open it: {e})', file=sys.stderr)
+
+
+def html_to_pdf(html_path, pdf_path):
+    """Print the rendered page to PDF through a headless Chromium.
+
+    Why a browser and not AppKit: ~/bin/md2pdf goes NSAttributedString ->
+    NSPrintOperation, and that importer cannot draw a table at any price --
+    tested 2026-08-10 with CSS border-collapse AND legacy border= attributes;
+    both flatten every cell onto its own line. A browser has a real CSS engine,
+    so ruled tables, page-break control and repeating header rows all work.
+
+    The stylesheet does the typography; this only presses Print. --no-margins is
+    deliberate: the sheet's own margins live in @page and the measure is pinned
+    on the body, so Chrome must not add a second set on top.
+    """
+    exe = find_browser()
+    if not exe:
+        return False, ('no Chromium-family browser found for --pdf. Install Chrome/Chromium, '
+                       'or open the HTML and print to PDF by hand (Margins: None, '
+                       'Background graphics: ON).')
+    # No --user-data-dir: a private profile made Chrome write the PDF correctly and
+    # then never exit (2026-08-10), so the run looked like a failure while the file
+    # on disk was perfect. Headless shares the default profile happily, even with a
+    # normal Chrome window open.
+    #
+    # And do not trust process exit as the completion signal either -- wait for the
+    # FILE to appear and stop growing, then stand the browser down.
+    cmd = [exe, '--headless', '--disable-gpu',
+           '--no-pdf-header-footer', '--no-margins',
+           f'--print-to-pdf={pdf_path}', 'file://' + html_path]
+    if os.path.exists(pdf_path):
+        os.remove(pdf_path)
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline, last, stable = time.time() + 90, -1, 0
+    try:
+        while time.time() < deadline:
+            size = os.path.getsize(pdf_path) if os.path.exists(pdf_path) else 0
+            if size > 1200 and size == last:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+            last = size
+            if proc.poll() is not None and size > 1200:
+                break
+            time.sleep(0.25)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1200):
+        return False, 'the browser produced no usable PDF'
+    return True, ''
+
+
+
+def _preview_sync(path, reopen=False):
+    """Close any Preview window already showing `path`; optionally reopen it.
+
+    Preview does not reload a PDF that has been replaced on disk, so without
+    this a re-render leaves a window still rendering the superseded version —
+    two windows for one file, one of them silently stale. Returns True if
+    Preview had the file open. Never launches Preview.
+    """
+    import os as _os, subprocess as _sp
+    if sys.platform != 'darwin':
+        return False
+    p = _os.path.abspath(_os.path.expanduser(path))
+    if _sp.run(['pgrep', '-x', 'Preview'], stdout=_sp.DEVNULL).returncode != 0:
+        return False
+    scpt = (
+        'on run argv\n'
+        '  set t to item 1 of argv\n'
+        '  set found to false\n'
+        '  tell application "Preview"\n'
+        '    repeat with i from (count documents) to 1 by -1\n'
+        '      try\n'
+        '        if (path of document i) is t then\n'
+        '          set found to true\n'
+        '          close document i saving no\n'
+        '        end if\n'
+        '      end try\n'
+        '    end repeat\n'
+        '  end tell\n'
+        '  return found as string\n'
+        'end run\n')
+    try:
+        r = _sp.run(['osascript', '-e', scpt, p],
+                    capture_output=True, text=True, timeout=20)
+        was_open = r.stdout.strip() == 'true'
+    except Exception:
+        return False
+    if was_open and reopen:
+        _sp.run(['open', p])
+    return was_open
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument('file')
+    ap.add_argument('--save', action='store_true')
+    ap.add_argument('--out')
+    ap.add_argument('--no-open', action='store_true')
+    ap.add_argument('--title')
+    ap.add_argument('--pdf', nargs='?', const='', default=None, metavar='PATH',
+                    help='render straight to PDF (default: alongside the source). '
+                         'THE OUTBOUND ROUTE.')
+    ap.add_argument('--measure', default=os.environ.get('TYPESET_MEASURE', '118mm'),
+                    help='text column width, e.g. 128mm (env TYPESET_MEASURE). '
+                         'Change the body font and you MUST re-measure: `pdf-measure`.')
+    ap.add_argument('--body-font', default=os.environ.get(
+                        'TYPESET_BODY_FONT',
+                        '"Gill Sans", "Gill Sans MT", "Gill Sans Nova", '
+                        '"Helvetica Neue", -apple-system, sans-serif'),
+                    help='body font stack (env TYPESET_BODY_FONT)')
+    a = ap.parse_args()
+
+    src = os.path.abspath(os.path.expanduser(a.file))
+    if not os.path.isfile(src):
+        sys.exit(f'render-doc: no such file: {src}')
+    with open(src, encoding='utf-8') as f:
+        text = f.read()
+
+    meta, body = strip_frontmatter(text)
+    global DOC_DIR
+    DOC_DIR = os.path.dirname(src)
+    body_html = render_body(body)
+
+    first_h1 = re.search(r'<h1>(.*?)</h1>', body_html)
+    title = a.title or meta.get('title') or (re.sub('<[^>]+>', '', first_h1.group(1)) if first_h1 else None) \
+        or os.path.splitext(os.path.basename(src))[0]
+
+    subparts = [meta.get(k) for k in ('type', 'date') if meta.get(k)]
+    if subparts and first_h1:
+        sub = ' · '.join(subparts)
+        body_html = body_html.replace('</h1>', f'</h1>\n<p class="sub">{html.escape(sub)}</p>', 1)
+
+    css = CSS.replace('@@MEASURE@@', a.measure).replace('@@BODYFONT@@', a.body_font)
+    page = TEMPLATE.format(title=html.escape(title), css=css, body=body_html)
+
+    if a.out:
+        dest = os.path.abspath(os.path.expanduser(a.out))
+    elif a.save:
+        dest = os.path.splitext(src)[0] + '.html'
+    else:
+        cache = os.path.expanduser('~/.cache/render-doc')
+        os.makedirs(cache, exist_ok=True)
+        slug = re.sub(r'[^\w.-]+', '-', os.path.basename(src)).strip('-')
+        h = hashlib.sha1(src.encode()).hexdigest()[:8]
+        dest = os.path.join(cache, f'{h}-{slug}.html')
+
+    with open(dest, 'w', encoding='utf-8') as f:
+        f.write(page)
+
+    if a.pdf is not None:
+        pdf = os.path.abspath(os.path.expanduser(a.pdf)) if a.pdf \
+            else os.path.splitext(src)[0] + '.pdf'
+        ok, why = html_to_pdf(dest, pdf)
+        if not ok:
+            sys.exit(f'render-doc: {why}')
+        print(pdf)
+        if not a.no_open:
+            _preview_sync(pdf)      # drop the stale window before reopening
+            open_file(pdf)
+        return
+
+    print(dest)
+    if not a.no_open:
+        open_file(dest)
+
+
+if __name__ == '__main__':
+    main()
