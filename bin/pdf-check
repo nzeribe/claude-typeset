@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""pdf-check — read a finished PDF and ask it the questions that catch real defects.
+"""pdf-check — read finished PDFs and ask them the questions that catch real defects.
 
-    pdf-check <file.pdf> [--expect "phrase"] [--markers "TODO,FIXME"] [--quiet]
+    pdf-check <file.pdf> [file.pdf ...] [--expect "phrase"] [--markers "A,B"]
+    pdf-check *.pdf                     # a whole build folder at once
 
 Exit code 0 if everything passes, 1 if anything fails. Safe in a build script.
 
@@ -15,66 +16,66 @@ library that can actually read it.
 The second lesson is bigger than the first: a check only finds what it is told
 to look for. When a defect gets through, WIDEN THE CHECK — don't just fix the
 instance. Every question below was added the day something got past the ones
-above it.
+above it, and the blank-page and marker lists below were merged in from an
+older, narrower checker rather than replacing it with something that looked
+newer and caught less.
 
 THE QUESTIONS
   1. Drafter's notes    — unresolved markers, internal commentary, TODOs
   2. HTML entities      — `&nbsp;` and friends rendered LITERALLY, as characters
-  3. Numbering          — ordered lists silently restarting at 1
-  4. Pagination         — does a multi-page document carry page numbers
-  5. Freshness          — is the newest change actually in this build
+  3. Blank pages        — a page that came out empty, which nobody proofreads
+  4. Numbering          — ordered lists silently restarting at 1
+  5. Pagination         — does a multi-page document carry page numbers
+  6. Freshness          — is the newest change actually in this build
 
-(4) and (5) exist because a build folder fills with near-identical PDFs and
+(5) and (6) exist because a build folder fills with near-identical PDFs and
 nothing in a filename says "superseded". A stale build is identified by what it
 is MISSING: pick a phrase only the current version has and pass it to --expect.
 
+MARKERS: the defaults are generic. Add your own house markers with --markers,
+or set PDFCHECK_MARKERS once for a project — e.g. a drafting convention, or the
+word "operator" if your notes-to-self use it. Mind the false positives: a
+citation format like "[REF1/x]" is not a placeholder.
+
 Part of claude-typeset. MIT.
 """
-import sys, re, argparse
+import sys, os, re, glob, argparse
 
-DEFAULT_MARKERS = ['⟦', '⟧', '<!--', 'TODO', 'FIXME', 'XXX', 'CONFIRM',
-                   'DRAFT', 'TK', '[[', 'Lorem ipsum']
-ENTITIES = ['&nbsp;', '&amp;', '&lt;', '&gt;', '&quot;', '&#']
+DEFAULT_MARKERS = ['⟦', '⟧', '<!--', '-->', 'TODO', 'FIXME', 'XXX', 'CONFIRM',
+                   'VERIFY', 'DECIDE', 'PLACEHOLDER', 'DRAFT', 'TK',
+                   '[[', 'Lorem ipsum', 'Drafting notes']
+ENTITIES = ['&nbsp', '&emsp', '&ensp', '&amp', '&lt', '&gt', '&quot', '&#']
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Verify a rendered PDF before it leaves the house.")
-    ap.add_argument('pdf')
-    ap.add_argument('--expect', action='append', default=[],
-                    help='a phrase that MUST be present (repeatable) — proves this '
-                         'is the current build, not a stale sibling')
-    ap.add_argument('--markers', help='comma-separated extra leak markers')
-    ap.add_argument('--no-numbering', action='store_true', help='skip the numbering check')
-    ap.add_argument('--quiet', action='store_true', help='only report failures')
-    a = ap.parse_args()
+def check_one(path, a, fitz):
+    """Ask one PDF every question. Returns (n_failures, n_notes)."""
+    fails, notes = [], []
+
+    def ok(label, detail=''):
+        if not a.quiet:
+            print(f"    ✓ {label}" + (f"  — {detail}" if detail else ''))
+
+    def bad(label, detail):
+        fails.append(label)
+        print(f"    ✗ {label}  — {detail}")
 
     try:
-        import fitz
-    except ImportError:
-        sys.exit("pdf-check needs PyMuPDF:  pip install pymupdf")
+        doc = fitz.open(path)
+    except Exception as e:
+        print(f"  ?? {path}: cannot open — {e}")
+        return 1, 0
 
-    doc = fitz.open(a.pdf)
     pages = [p.get_text() for p in doc]
     n = doc.page_count
     doc.close()
     raw = "".join(pages)
 
-    fails = []
-    notes = []
-
-    def ok(label, detail=''):
-        if not a.quiet:
-            print(f"  ✓ {label}" + (f"  — {detail}" if detail else ''))
-
-    def bad(label, detail):
-        fails.append(label)
-        print(f"  ✗ {label}  — {detail}")
-
-    print(f"\n  {a.pdf}   ({n} page{'s' if n != 1 else ''})")
-    print(f"  {'─' * 58}")
+    print(f"\n  {path}   ({n} page{'s' if n != 1 else ''})")
 
     # 1. drafter's notes ------------------------------------------------------
     markers = list(DEFAULT_MARKERS)
+    if os.environ.get('PDFCHECK_MARKERS'):
+        markers += [m.strip() for m in os.environ['PDFCHECK_MARKERS'].split(',') if m.strip()]
     if a.markers:
         markers += [m.strip() for m in a.markers.split(',') if m.strip()]
     hits = sorted({m for m in markers if m in raw})
@@ -92,7 +93,15 @@ def main():
     else:
         ok("no literal HTML entities")
 
-    # 3. ordered-list numbering ------------------------------------------------
+    # 3. blank pages -----------------------------------------------------------
+    blank = [i + 1 for i, p in enumerate(pages) if len(p.strip()) < 5]
+    if blank:
+        bad("blank pages", f"page(s) {blank} came out empty — a blank page is the "
+                           "one nobody proofreads")
+    else:
+        ok("no blank pages", f"{len(raw):,} characters across {n}")
+
+    # 4. ordered-list numbering ------------------------------------------------
     if not a.no_numbering:
         seq = [int(m) for m in re.findall(r'(?m)^\s*(\d{1,3})[.)]\s', raw)]
         restarts = [i for i in range(1, len(seq)) if seq[i] == 1 and seq[i - 1] > 1]
@@ -107,7 +116,7 @@ def main():
         else:
             ok("numbering runs clean", f"{len(seq)} numbered items, no restarts")
 
-    # 4. pagination ------------------------------------------------------------
+    # 5. pagination ------------------------------------------------------------
     if n > 1:
         paged = bool(re.search(r'Page\s+\d+\s+of\s+\d+', raw)) or \
             sum(bool(re.search(r'(?m)^\s*\d{1,3}\s*$', p)) for p in pages) >= n - 1
@@ -115,12 +124,12 @@ def main():
             ok("pages are numbered")
         else:
             notes.append("pagination")
-            print("  ! no page numbers found  — a multi-page document should carry "
-                  "them:\n      pdf-paginate \"" + a.pdf + "\" \"<label>\"  (run it LAST)")
+            print(f"    ! no page numbers found  — a multi-page document should "
+                  f"carry them:\n        pdf-paginate \"{path}\" \"<label>\"  (run it LAST)")
     else:
         ok("single page", "pagination not needed")
 
-    # 5. freshness -------------------------------------------------------------
+    # 6. freshness -------------------------------------------------------------
     # Whitespace is normalised on both sides: a phrase that WRAPS across a line
     # arrives from the extractor with a newline inside it, and a check that
     # cries wolf on a good build is a check that gets switched off.
@@ -132,14 +141,46 @@ def main():
             bad("expected phrase MISSING", f"{phrase[:48]!r} — this looks like a "
                                            "STALE build. Check the folder for siblings.")
 
-    print(f"  {'─' * 58}")
-    if fails:
-        print(f"  ✗ {len(fails)} FAILED: {', '.join(fails)}. Do not send.\n")
+    return len(fails), len(notes)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Verify rendered PDFs before they leave the house.")
+    ap.add_argument('pdf', nargs='+', help='one or more PDFs (globs accepted)')
+    ap.add_argument('--expect', action='append', default=[],
+                    help='a phrase that MUST be present (repeatable) — proves this '
+                         'is the current build, not a stale sibling')
+    ap.add_argument('--markers', help='comma-separated extra leak markers '
+                                      '(or set PDFCHECK_MARKERS)')
+    ap.add_argument('--no-numbering', action='store_true', help='skip the numbering check')
+    ap.add_argument('--quiet', action='store_true', help='only report failures')
+    a = ap.parse_args()
+
+    try:
+        import fitz
+    except ImportError:
+        sys.exit("pdf-check needs PyMuPDF:  pip install pymupdf")
+
+    files = []
+    for arg in a.pdf:
+        files.extend(sorted(glob.glob(arg)) if any(c in arg for c in '*?[') else [arg])
+    if not files:
+        sys.exit("pdf-check: no PDFs matched")
+
+    print(f"  {'─' * 60}")
+    bad_files, noted = 0, 0
+    for f in files:
+        fails, notes = check_one(f, a, fitz)
+        bad_files += 1 if fails else 0
+        noted += notes
+    print(f"  {'─' * 60}")
+
+    if bad_files:
+        print(f"  ✗ {bad_files} of {len(files)} FAILED. Do not send.\n")
         sys.exit(1)
-    if notes:
-        print("  ✓ passed, with a note above.\n")
-    else:
-        print("  ✓ all checks passed.\n")
+    print(f"  ✓ {len(files)} file{'s' if len(files) != 1 else ''} passed"
+          + (", with notes above.\n" if noted else ".\n"))
 
 
 if __name__ == '__main__':
