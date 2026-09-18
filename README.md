@@ -37,10 +37,26 @@ Claude Code skills live in `~/.claude/skills/<name>/`:
 ```bash
 git clone https://github.com/nzeribe/claude-typeset.git ~/.claude/skills/typeset
 pip install pymupdf
+bash ~/.claude/skills/typeset/install.sh
 ```
 
 You also need a Chromium-family browser (Chrome, Chromium, Brave or Edge)
-installed — it is the typesetter, for the reason in rule 7.
+installed — it is the typesetter, for the reason in rule 7. The installer
+checks for all three and tells you what's missing.
+
+### Making it the default
+
+That third line is the one that matters. A skill only fires when something
+triggers it — so `install.sh` also appends a short block to `~/.claude/CLAUDE.md`,
+which Claude Code loads at the start of **every** session. After that, "make me
+a PDF of this" goes down this pipeline without anyone having to remember the
+skill exists, in any project, forever.
+
+The block is exactly [`default-style.md`](./default-style.md) — read it first if
+you'd rather paste it in by hand. The installer is non-destructive: it backs up
+your `CLAUDE.md` before touching it, it is fenced with markers so re-running
+updates in place instead of duplicating, and `bash install.sh --check` reports
+what it *would* do and changes nothing.
 
 Optional, so you can run the tools from anywhere:
 
